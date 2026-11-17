@@ -28,6 +28,10 @@ files stay completely stock.
 - `entry` (Enter/`o`/`O`): no placeholders among the targets → plain `open`.
   Otherwise download with `head -c1`, then `refresh` the MIME types and
   `open` everything that landed.
+- `entry` with `trash` (`d`): no target under `Library/CloudStorage` or
+  `Library/Mobile Documents` that is or contains a placeholder (`find -flags
+  +dataless`) → plain `remove`. Otherwise confirm, trash everything, and
+  permanently delete (`fs.remove`) the placeholder targets that failed.
 - `peek`: the placeholder card. If the file has become local, it calls
   `refresh` and yazi re-peeks with the normal previewer.
 
@@ -57,6 +61,17 @@ files stay completely stock.
 - **The Linemode is drawn over the row style.** On a reversed hovered row
   (`th.indicator.current`), a plain `fg` marker becomes a colored block.
   `marker()` pre-swaps fg/bg so the reversal swaps them back.
+- **`ya.confirm` can't fill the dialog's file list** (`list` is a TODO in
+  26.9.1) and always centers the body. `trash_body` fakes yazi's layout in
+  the body: a centered note, a drawn `─` separator (the body is the same
+  width as yazi's), then left-aligned lines (`Line:align` beats the
+  paragraph's alignment) with a one-space margin, wrapped by hand to the
+  list's width like ratatui's word wrap. That needs the terminal size, which
+  Lua can't query, so the status bar child records it from its area.
+- **An async `entry` counts as a task until it returns,** so a dialog shown
+  from it leaves "1 left" in the status bar. `start_trash` hands the dialog
+  and the deletion to `ya.async` from a sync block, which runs them on the
+  main thread like yazi's trash preset does.
 - **Linemode order:** `solo` (the date etc.) is at 1000, so the marker's
   default of 500 puts it before the date.
 
@@ -71,6 +86,18 @@ files stay completely stock.
   `RETRY_WAIT`. Inspect with
   `/usr/bin/log show --last 10m --predicate 'process == "fileproviderd"'`
   (plain `log` is a zsh builtin).
+- **Placeholders from a provider without its own trash can't be trashed
+  in place.** SeaDrive doesn't support trashing, so macOS moves the item into
+  `~/.Trash`, which needs its data. NSFileManager (yazi's trash) fails with
+  `NSCocoaErrorDomain 3328` ("the volume … doesn't have one") for a placeholder
+  or a folder containing one, and the yazi task just shows "Failed". Finder
+  downloads first. The plugin deletes instead: `unlink` on a placeholder
+  downloads nothing, and SeaDrive sends it to the server as a normal delete
+  (`delete-item` in the fileproviderd log), where the library trash keeps it.
+  Lua can't trash a given path, and `remove_do`'s targets can't come from Lua,
+  so `move_to_trash` calls NSFileManager through `osascript -l JavaScript`.
+  Trash is tried first, so providers that can trash placeholders (iCloud,
+  presumably) never lose them permanently.
 - **A stalled provider blocks `head` forever.** There is no timeout, so the
   marker stays on "downloading".
 - **Local → placeholder ("Remove Download") is unverified.** It changes ctime,
@@ -92,8 +119,11 @@ There are no automated tests. Run a real yazi with an isolated config:
 `plugins/cloudfiles.yazi` symlinked to this repo, driven through tmux
 (`send-keys`, then `capture-pane -e` to see styles).
 
-- **Real placeholders can't be created by hand.** Put fake `stat`/`head`
-  scripts first on `PATH`:
+- **Real placeholders:** write a test file into the provider's folder, wait
+  for it to upload, then evict it with
+  `NSFileManager.evictUbiquitousItemAtURL:error:` (JXA works). It can take a
+  second try. For failure cases, put fake `stat`/`head` scripts first on
+  `PATH`:
   - `stat` reports `dataless` for files under a folder whose path contains
     `Library/CloudStorage`, until a marker file exists.
   - `head` sleeps, then creates the marker. Name patterns can make it fail
@@ -104,6 +134,9 @@ There are no automated tests. Run a real yazi with an isolated config:
   - Never more than `PARALLEL` `head` processes, even across several presses.
   - A failed file keeps its cloud marker while the rest still open.
   - Pressing twice downloads once.
+  - `d` on a placeholder, and on a folder containing one, deletes it without
+    a `materialize(` in the fileproviderd log. `d` on a local file in the
+    provider's folder shows yazi's own dialog and ends up in `~/.Trash`.
 
 API reference: the yazi source at the matching tag, mainly
 `yazi-plugin/preset/{plugins,components}/`.

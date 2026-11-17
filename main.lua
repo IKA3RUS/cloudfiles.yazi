@@ -10,7 +10,8 @@
 -- * fetch: give placeholders the MIME type `cloud/placeholder` without reading
 --          them. No previewer or preloader matches it, so nothing downloads
 --          them; local files fall through to yazi's own `mime.local`.
--- * entry: download placeholders in the background, then open them
+-- * entry: download placeholders in the background, then open them; with
+--          `trash`, delete placeholders the sync app can't trash
 -- * peek:  show a card for placeholders instead of a preview
 --
 -- Everything that crosses into a sync block or `ya.emit` is a plain path
@@ -70,6 +71,10 @@ local free_slot = ya.sync(function(st) st.running = math.max(0, (st.running or 0
 
 local get_card = ya.sync(function(st) return st.icon or ICONS.nerd.cloud, st.center end)
 
+local get_dialog = ya.sync(
+	function(st) return st.icon or ICONS.nerd.cloud, st.color or "blue", st.cols or 80, st.rows or 24 end
+)
+
 -- Paths of the selected files, or of the hovered file if nothing is selected.
 -- The second value is true when nothing is selected and a directory is hovered.
 local get_targets = ya.sync(function()
@@ -87,6 +92,20 @@ local get_targets = ya.sync(function()
 		paths[1] = tostring(h.url.path)
 	end
 	return paths, false
+end)
+
+-- Paths `remove` would act on: the selection, or else the hovered entry
+-- (directories included). The second value is true for a selection.
+local get_remove_targets = ya.sync(function()
+	local tab, paths = cx.active, {}
+	for _, u in pairs(tab.selected) do
+		paths[#paths + 1] = tostring(u.path)
+	end
+	if #paths > 0 then
+		return paths, true
+	end
+	local h = tab.current.hovered
+	return h and { tostring(h.url.path) } or {}, false
 end)
 
 ---------------------------------------------------------------------------
@@ -156,6 +175,47 @@ end
 
 local function basename(p) return p:match("[^/]+$") or p end
 
+local function lines(s)
+	local t = {}
+	for line in (s or ""):gmatch("[^\n]+") do
+		t[#t + 1] = line
+	end
+	return t
+end
+
+-- The `paths` that are, or contain, a placeholder. `find` only reads
+-- metadata, though it makes the provider list folders it hasn't listed yet.
+local function with_placeholders(paths)
+	local out = Command("find"):arg(paths):arg({ "-flags", "+dataless" }):stderr(Command.NULL):output()
+	local found = lines(out and out.stdout)
+	local res = {}
+	for _, p in ipairs(paths) do
+		for _, f in ipairs(found) do
+			if f == p or f:sub(1, #p + 1) == p .. "/" then
+				res[#res + 1] = p
+				break
+			end
+		end
+	end
+	return res
+end
+
+-- NSFileManager's trash, the same call yazi makes on macOS (Lua has no API
+-- to trash a given path). Returns the paths it couldn't move.
+local TRASH_JS = [[
+ObjC.import("Foundation")
+function run(argv) {
+	const fm = $.NSFileManager.defaultManager
+	return argv.filter((p) => !fm.trashItemAtURLResultingItemURLError($.NSURL.fileURLWithPath(p), null, null)).join("\n")
+}]]
+
+local function move_to_trash(paths)
+	local out = Command("osascript"):arg({ "-l", "JavaScript", "-e", TRASH_JS }):arg(paths):output()
+	if not out or not out.status.success then
+		return paths
+	end
+	return lines(out.stdout)
+end
 
 -- Runs another fetcher on `files` from inside our coroutine, passing its
 -- results through (the same pattern yazi's mime.remote uses).
@@ -181,6 +241,7 @@ local function setup(st, opts)
 	local down = opts.downloading or set.downloading
 
 	local color = opts.color or "blue"
+	st.color = color
 	local style = ui.Style():fg(color)
 
 	-- Themes often draw the hovered row reversed, which would turn a colored
@@ -214,7 +275,10 @@ local function setup(st, opts)
 	end, opts.order or 500) -- before the linemode (solo, 1000)
 
 	-- Active download count in the status bar
-	Status:children_add(function()
+	-- Also records the terminal size (the status bar spans its full width),
+	-- which the trash dialog needs to lay out its list like yazi's own.
+	Status:children_add(function(self)
+		st.cols, st.rows = self._area.w, self._area.y + self._area.h
 		if st.active == 0 then
 			return ""
 		end
@@ -256,10 +320,192 @@ local function fetch(_, job)
 end
 
 ---------------------------------------------------------------------------
--- Functional plugin: download if needed, then open
+-- Functional plugin: open (downloading first), and trash
 ---------------------------------------------------------------------------
 
+-- File Provider folders, the same ones the README's fetchers cover.
+local function in_cloud(p)
+	return p:find("/Library/CloudStorage/", 1, true) or p:find("/Library/Mobile Documents/", 1, true)
+end
+
+-- Greedy word wrap, the way yazi's confirm list wraps: a word that doesn't
+-- fit starts a new line, a word wider than a line is split. `words` is a list
+-- of { text, style }; returns lines as lists of spans.
+local function wrap(words, w)
+	local function width(t) return ui.Line(t):width() end
+	local lines, cur, cw = {}, {}, 0
+	local function flush()
+		lines[#lines + 1], cur, cw = cur, {}, 0
+	end
+	for i, word in ipairs(words) do
+		local text, style = word[1], word[2]
+		local tw = width(text)
+		if cw > 0 and cw + 1 + tw > w then
+			flush()
+		elseif i > 1 and cw > 0 then
+			cur[#cur + 1], cw = ui.Span(" "):style(style), cw + 1
+		end
+		if cw + tw <= w then
+			cur[#cur + 1], cw = ui.Span(text):style(style), cw + tw
+		else
+			local piece, pw = "", 0
+			for _, c in utf8.codes(text) do
+				local ch = utf8.char(c)
+				local chw = width(ch)
+				if cw + pw + chw > w then
+					cur[#cur + 1] = ui.Span(piece):style(style)
+					flush()
+					piece, pw = "", 0
+				end
+				piece, pw = piece .. ch, pw + chw
+			end
+			cur[#cur + 1], cw = ui.Span(piece):style(style), cw + pw
+		end
+	end
+	if #cur > 0 then
+		flush()
+	end
+	return lines
+end
+
+local function words(text, style)
+	local t = {}
+	for word in (text .. " "):gmatch("(.-) ") do
+		t[#t + 1] = { word, style }
+	end
+	return t
+end
+
+-- Lines for the confirm body that look like yazi's trash dialog. ya.confirm
+-- can't fill the dialog's file list and always centers the body, so the
+-- note is centered above a drawn separator, and every list line is
+-- left-aligned with the list's margin, icon and style. Cloud targets get the
+-- list marker.
+local function trash_body(targets, cloud)
+	local icon, color, cols, rows = get_dialog()
+	local w, h = math.min(70, cols), math.min(20, rows)
+	local inner = w - 2 -- the body's width; the list's text is 1 cell narrower on each side
+	local room = h - 4 -- minus borders, the separator above the buttons, and the buttons
+
+	local body = {}
+	-- An extra space after a Nerd Font icon: Ghostty draws it two cells wide
+	-- over the blank cell after it, which would leave no gap before "are".
+	local gap = " "
+	for _, c in utf8.codes(icon) do
+		if c >= 0xE000 and c <= 0xF8FF or c >= 0xF0000 then
+			gap = "  "
+		end
+	end
+	local note = string.format("Items marked %s%sare or contain cloud-only files. ", icon, gap)
+		.. "If the sync app can't trash them, they're deleted permanently instead."
+	for _, spans in ipairs(wrap(words(note, th.confirm.body), inner)) do
+		body[#body + 1] = ui.Line(spans):align(ui.Align.CENTER)
+	end
+	body[#body + 1] = ui.Line(string.rep("─", inner)):style(th.confirm.border)
+
+	local is_cloud = {}
+	for _, p in ipairs(cloud) do
+		is_cloud[p] = true
+	end
+	local list = th.confirm.list
+	for i, p in ipairs(targets) do
+		local u = Url(p)
+		local cha = fs.cha(u)
+		local ic = cha and th.icon:match(File { url = u, cha = cha }, { hovered = false })
+		local ws = words(p, list)
+		if ic then
+			table.insert(ws, 1, { ic.text, ic.style })
+		end
+		if is_cloud[p] then
+			ws[#ws + 1] = { icon, ui.Style():fg(color) }
+		end
+		local lines = wrap(ws, inner - 2)
+		local more = #targets - i
+		if #body + #lines + (more > 0 and 1 or 0) > room then
+			body[#body + 1] = ui.Line(" ... and " .. (#targets - i + 1) .. " more"):style(list):align(ui.Align.LEFT)
+			break
+		end
+		for _, spans in ipairs(lines) do
+			table.insert(spans, 1, ui.Span(" "))
+			body[#body + 1] = ui.Line(spans):align(ui.Align.LEFT)
+		end
+	end
+	return body
+end
+
+-- `remove` (trash) for selections with placeholders. Providers without a
+-- trash macOS can use (SeaDrive) make it move trashed items into ~/.Trash,
+-- which needs their data: NSFileManager refuses a placeholder ("the volume
+-- doesn't have one") and Finder downloads it first. Deleting it instead
+-- downloads nothing and reaches the server as a normal delete, where the
+-- provider's own trash (SeaDrive's library trash) keeps it. Everything is
+-- trashed first, so providers that can trash placeholders (iCloud) still do.
+local function trash(targets, cloud, selected)
+	local n = #targets
+	local confirmed = ya.confirm {
+		pos = { "center", w = 70, h = 20 },
+		title = ui.Line(string.format("Trash %d selected file%s?", n, n == 1 and "" or "s")),
+		body = ui.Text(trash_body(targets, cloud)),
+	}
+	if not confirmed then
+		return
+	end
+	if selected then
+		ya.emit("escape", { select = true })
+	end
+
+	local is_cloud = {}
+	for _, p in ipairs(cloud) do
+		is_cloud[p] = true
+	end
+
+	local not_trashed, not_deleted = {}, {}
+	for _, p in ipairs(move_to_trash(targets)) do
+		if not is_cloud[p] then
+			not_trashed[#not_trashed + 1] = basename(p)
+		else
+			local cha = fs.cha(Url(p))
+			if not (cha and fs.remove(cha.is_dir and "dir_all" or "file", Url(p))) then
+				not_deleted[#not_deleted + 1] = basename(p)
+			end
+		end
+	end
+
+	local msgs = {}
+	if #not_trashed > 0 then
+		msgs[#msgs + 1] = table.concat(not_trashed, ", ") .. "\nCouldn't move to the Trash."
+	end
+	if #not_deleted > 0 then
+		msgs[#msgs + 1] = table.concat(not_deleted, ", ") .. "\nCouldn't delete."
+	end
+	if #msgs > 0 then
+		ya.notify { title = "Uh Oh!", content = table.concat(msgs, "\n"), timeout = 8, level = "error" }
+	end
+end
+
+-- Runs `trash` on the main thread, like yazi's own trash plugin does with its
+-- dialog. Left in this task, the dialog would keep the task running, and
+-- the status bar would show "1 left" until it's answered.
+local start_trash = ya.sync(function(_, targets, cloud, selected)
+	ya.async(function() trash(targets, cloud, selected) end)
+end)
+
 local function entry(_, job)
+	if job.args[1] == "trash" then
+		local targets, selected = get_remove_targets()
+		local maybe = {}
+		for _, p in ipairs(targets) do
+			if in_cloud(p) then
+				maybe[#maybe + 1] = p
+			end
+		end
+		local cloud = #maybe > 0 and with_placeholders(maybe) or {}
+		if #cloud == 0 then
+			return ya.emit("remove", {})
+		end
+		return start_trash(targets, cloud, selected)
+	end
+
 	local interactive = job.args.interactive and true or nil
 	local targets, hovered_dir = get_targets()
 

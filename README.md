@@ -19,6 +19,8 @@ With this plugin:
 - Hovering one shows its size instead of a preview.
 - Pressing Enter downloads it in the background (a download icon in the list, a counter
   in the status bar), then opens it. You can keep browsing meanwhile.
+- Trashing a cloud file from an app like SeaDrive deletes it without downloading
+  it, and the sync app's own trash keeps it.
 - Downloaded files preview and open exactly as they normally would.
 
 ## Requirements
@@ -79,7 +81,8 @@ mime = "cloud/*"
 run  = "cloudfiles"
 ```
 
-And this to your `keymap.toml`, so opening a file downloads it first:
+And this to your `keymap.toml`, so opening a file downloads it first and
+trashing works on cloud files:
 
 ```toml
 [[mgr.prepend_keymap]]
@@ -96,6 +99,11 @@ desc = "Open (download cloud files first)"
 on   = "O"
 run  = "plugin cloudfiles -- --interactive"
 desc = "Open interactively (download cloud files first)"
+
+[[mgr.prepend_keymap]]
+on   = "d"
+run  = "plugin cloudfiles -- trash"
+desc = "Trash selected files (delete cloud files)"
 ```
 
 For files that are already on your Mac these keys do exactly what Yazi
@@ -108,6 +116,13 @@ normally does, so it's safe to bind them everywhere.
 - A failed download is retried after 1, 1, 1, 10, 30 and 60 seconds, since
   sync apps sometimes refuse the first tries. If it still fails (for example, the sync
   app is offline), the file keeps its cloud icon and you get a notification.
+- Some sync apps, like SeaDrive, keep their trash on the server, and macOS
+  can't move a cloud file into your Mac's Trash without downloading it (Finder
+  downloads it first). With `d`, such cloud files, and folders containing
+  them, are deleted instead. The deletion reaches the server, where the sync
+  app's own trash keeps them for as long as it's set up to. Everything else,
+  and cloud files from apps that can trash them, like iCloud Drive, still goes
+  to your Trash. The confirmation tells you when this may happen.
 - Only the keys above download in the background. Opening a cloud file any
   other way, such as double-clicking it, lets macOS download it first while
   Yazi waits.
